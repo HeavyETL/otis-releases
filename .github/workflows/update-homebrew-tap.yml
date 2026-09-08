@@ -1,0 +1,92 @@
+name: Update Homebrew tap
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  update-cask:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: HeavyETL
+          repositories: homebrew-tap
+          permission-contents: write
+
+      - name: Read and verify release artifact
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          version=${TAG#v}
+          test "$TAG" = "v$version"
+          case "$version" in
+            ''|*[!0-9.]*|.*|*.) exit 1 ;;
+          esac
+          dmg="Otis-$version-macos-arm64.dmg"
+          checksum="$dmg.sha256"
+          appcast=appcast.xml
+          gh release download "$TAG" \
+            --repo HeavyETL/otis-releases \
+            --pattern "$dmg" \
+            --pattern "$checksum" \
+            --pattern "$appcast"
+          test -s "$appcast"
+          shasum -a 256 -c "$checksum"
+          sha256=$(cut -d ' ' -f 1 "$checksum")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: HeavyETL/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: homebrew-tap
+
+      - name: Update cask
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          set -eu
+          cask=homebrew-tap/Casks/otis.rb
+          sed -E -i.bak "s/^  version \"[^\"]+\"/  version \"$VERSION\"/" "$cask"
+          sed -E -i.bak "s/^  sha256 \"[0-9a-f]+\"/  sha256 \"$SHA256\"/" "$cask"
+          rm -f "$cask.bak"
+          if ! grep -Fq "  auto_updates true" "$cask"; then
+            python3 -c 'from pathlib import Path; p = Path("'"$cask"'"); s = p.read_text(); anchor = "  app \"Otis.app\"\n"; assert anchor in s; p.write_text(s.replace(anchor, "  auto_updates true\n\n" + anchor, 1))'
+          fi
+          grep -Fq "  auto_updates true" "$cask"
+          grep -Fq "  version \"$VERSION\"" "$cask"
+          grep -Fq "  sha256 \"$SHA256\"" "$cask"
+
+      - name: Commit cask update
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        working-directory: homebrew-tap
+        run: |
+          set -eu
+          if git diff --quiet -- Casks/otis.rb; then
+            echo "Cask already references Otis $VERSION"
+            exit 0
+          fi
+          user_id=$(gh api "/users/$APP_SLUG[bot]" --jq .id)
+          git config user.name "$APP_SLUG[bot]"
+          git config user.email "$user_id+$APP_SLUG[bot]@users.noreply.github.com"
+          git add Casks/otis.rb
+          git commit -m "Update Otis to $VERSION"
+          git push origin HEAD:main
